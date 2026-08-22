@@ -1,0 +1,286 @@
+\documentclass[10pt]{article}
+
+\usepackage[margin=0.65in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\down}{\ensuremath{\downarrow}}
+\newcommand{\up}{\ensuremath{\uparrow}}
+\newcommand{\asset}[1]{\includegraphics[width=\linewidth]{results_assets/#1}}
+
+\title{DriftXpress MNIST Results}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Experimental record}
+
+This report was assembled from the saved code, textual outputs, and embedded
+figures in the five notebooks in this folder.  No notebook was executed or
+modified while producing this report.  The experiment uses MNIST digits
+\(\{0,8,2,4,7,9\}\), with 35,788 training examples, 6,005 test examples,
+batch size 500, latent dimension 32, 200 drift landmarks, and 100 configured
+training epochs.  Because the notebook loops use \texttt{range(num\_epochs+1)},
+the saved runs actually include epochs 0 through 100.
+
+\paragraph{Metric comparability.}
+All five evaluation cells compare decoded generated images against flattened
+MNIST test pixels.  The reported ``FID'' is the implementation in
+\texttt{src/eval.py}, not canonical Inception-FID; PCA and UMAP are visual
+projections in these notebooks and do not produce a scalar score.
+
+\section*{Aggregate evaluation metrics}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Standardized pixel-space evaluation. Lower is better for SW, MMD, and FID; higher is better for coverage and entropy.}
+\begin{tabular}{l l rrrrr}
+\hline
+Algorithm & evaluation space & SW $\down$ & MMD $\down$ & FID $\down$ & coverage $\up$ & entropy $\up$ \\
+\hline
+1 & pixels & 0.156390 & 0.142476 & 32.506738 & 1.000000 & 0.999951 \\
+2 & pixels & 0.055698 & 0.019198 & 9.749420 & 1.000000 & 0.999930 \\
+3 & pixels & 0.145378 & 0.150643 & 60.209453 & 1.000000 & 0.999966 \\
+4 & pixels & 0.088063 & 0.043731 & 15.564459 & 1.000000 & 0.999738 \\
+5 & pixels & 0.115568 & 0.095509 & 49.368244 & 1.000000 & 0.999588 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\scriptsize
+\caption{Per-digit pixel-space FID values.}
+\begin{tabular}{c crrrrr}
+\hline
+Digit & space & Alg. 1 & Alg. 2 & Alg. 3 & Alg. 4 & Alg. 5 \\
+\hline
+0 & pixel & 58.9163 & 13.2347 & 86.5164 & 29.0469 & 82.2101 \\
+8 & pixel & 52.1156 & 17.3052 & 80.4397 & 24.8819 & 67.9792 \\
+2 & pixel & 46.5633 & 19.7732 & 74.4471 & 25.1308 & 66.0384 \\
+4 & pixel & 39.0935 & 16.1500 & 66.0835 & 20.6945 & 52.5338 \\
+7 & pixel & 34.4265 & 11.9323 & 68.3462 & 9.6142 & 47.2885 \\
+9 & pixel & 39.9167 & 14.6916 & 69.6437 & 18.5663 & 51.2729 \\
+\hline
+\end{tabular}
+\end{table}
+
+\section*{Algorithm summaries and losses}
+
+\subsection*{Algorithm 1: joint conditional training}
+
+Algorithm 1 trains the VAE and conditional latent generator in one loop with
+one optimizer object.  Its drift term acts directly on the raw generator
+latent, so the drift gradient reaches the generator but bypasses the encoder
+and decoder.  The saved run has pixel FID 32.51 and perfect class coverage,
+although its cache is built before training from sampled encoder latents.
+
+\[
+\mathcal L_1=\mathcal L_{\mathrm{recon}}
+ +\lambda_{\mathrm{KL}}\mathcal L_{\mathrm{KL}}
+ +\lambda_{\mathrm d}\mathcal L_{\mathrm{drift}}(z^-)
+ +\lambda_{\mathrm v}\bigl(\mathcal L_{\mathrm{var}}(z^+)+\mathcal L_{\mathrm{var}}(z^-)\bigr)
+ +\lambda_{\mathrm c}\bigl(\mathcal L_{\mathrm{cov}}(z^+)+\mathcal L_{\mathrm{cov}}(z^-)\bigr).
+\]
+
+\subsection*{Algorithm 2: separate VAE and generator optimization}
+
+Algorithm 2 first trains the VAE and then freezes it while optimizing a
+separate conditional latent generator.  The generator is trained only with
+drift, variance, and covariance objectives, so it cannot change the learned
+decoder or encoder representation.  Its pixel-space evaluation gives FID
+9.75 with complete class coverage.
+
+\[
+\begin{aligned}
+\mathcal L_{\mathrm{VAE}}&=\mathcal L_{\mathrm{recon}}
+ +\lambda_{\mathrm{KL}}\mathcal L_{\mathrm{KL}}
+ +\lambda_{\mathrm v}\mathcal L_{\mathrm{var}}(\mu)
+ +\lambda_{\mathrm c}\mathcal L_{\mathrm{cov}}(\mu),\\
+\mathcal L_{\mathrm G}&=\lambda_{\mathrm d}\mathcal L_{\mathrm{drift}}(z^-)
+ +\lambda_{\mathrm v}\mathcal L_{\mathrm{var}}(z^-)
+ +\lambda_{\mathrm c}\mathcal L_{\mathrm{cov}}(z^-).
+\end{aligned}
+\]
+
+\subsection*{Algorithm 3: fully joint re-encoded drift}
+
+Algorithm 3 sends generated latents through the decoder and deterministic
+encoder mean before applying drift.  This creates a differentiable path from
+the re-encoded drift loss to the generator, decoder, and encoder, without a
+cycle loss.  The saved pixel FID is 60.21, and the generated digit grid shows
+that the re-encoding path alone does not sufficiently constrain the raw
+generator latent.
+
+\[
+\mathcal L_3=\mathcal L_{\mathrm{recon}}
+ +\lambda_{\mathrm{KL}}\mathcal L_{\mathrm{KL}}
+ +\lambda_{\mathrm d}\mathcal L_{\mathrm{drift}}(\widetilde z^-)
+ +\lambda_{\mathrm v}\bigl(\mathcal L_{\mathrm{var}}(\mu)+\mathcal L_{\mathrm{var}}(\widetilde z^- )\bigr)
+ +\lambda_{\mathrm c}\bigl(\mathcal L_{\mathrm{cov}}(\mu)+\mathcal L_{\mathrm{cov}}(\widetilde z^- )\bigr),
+\qquad
+\widetilde z^-=\mu_\phi(D_\psi(G_\theta(\varepsilon,c))).
+\]
+
+\subsection*{Algorithm 4: latent discriminator}
+
+Algorithm 4 adds a class-conditional latent discriminator to Algorithm 1.
+The discriminator is trained with detached real and generated latents, while
+the generator receives a non-saturating BCE adversarial loss through the
+temporarily frozen discriminator.  Its pixel-space evaluation gives FID
+15.56 with complete class coverage.
+
+\[
+\begin{aligned}
+\mathcal L_4&=\mathcal L_1+\lambda_{\mathrm{adv}}\mathcal L_{\mathrm{adv}},\\
+\mathcal L_{\mathrm{disc}}&=\tfrac12\left[
+ \operatorname{BCE}(D_\omega(\operatorname{sg}(z^+),c),1)
+ +\operatorname{BCE}(D_\omega(\operatorname{sg}(z^-),c),0)\right],\\
+\mathcal L_{\mathrm{adv}}&=\operatorname{BCE}(D_\omega(z^-,c),1).
+\end{aligned}
+\]
+
+\subsection*{Algorithm 5: pretraining plus raw and re-encoded drift}
+
+Algorithm 5 pretrains the VAE for 25 epochs and builds the cache from
+deterministic encoder means.  During fully joint training it averages drift
+on the raw generator latent and on the decoded--re-encoded latent, preserving
+both direct generator control and the connected gradient path.  The L1
+coefficient is present but set to zero, and the saved pixel metrics are
+SW 0.115568, MMD 0.095509, and FID 49.37.
+
+\[
+\begin{aligned}
+\mathcal L_{\mathrm{pre}}&=\mathcal L_{\mathrm{recon}}
+ +\lambda_{\mathrm{L1}}\mathcal L_1
+ +\lambda_{\mathrm{KL}}\mathcal L_{\mathrm{KL}},\\
+\mathcal L_5&=\mathcal L_{\mathrm{recon}}
+ +\lambda_{\mathrm{L1}}\mathcal L_1
+ +\lambda_{\mathrm{KL}}\mathcal L_{\mathrm{KL}}
+ +\lambda_{\mathrm d}\tfrac12\left[
+ \mathcal L_{\mathrm{drift}}(z^-)+\mathcal L_{\mathrm{drift}}(\widetilde z^-)
+ \right]\\
+&\quad+\lambda_{\mathrm v}\bigl(\mathcal L_{\mathrm{var}}(\mu)+\mathcal L_{\mathrm{var}}(\widetilde z^- )\bigr)
+ +\lambda_{\mathrm c}\bigl(\mathcal L_{\mathrm{cov}}(\mu)+\mathcal L_{\mathrm{cov}}(\widetilde z^- )\bigr).
+\end{aligned}
+\]
+
+\section*{Model parameters and optimization settings}
+
+The notebook parameter-count cells instantiate constructor defaults rather
+than the later configured \(\texttt{LATENT\_DIM}=32\).  The table below gives
+the parameter counts for the actual trained configuration, recomputed from
+the architectures used by each training loop.
+
+\begin{table}[htbp]
+\centering
+\scriptsize
+\caption{Architecture and configured optimization parameters.}
+\begin{tabular}{p{0.06\textwidth} p{0.15\textwidth} p{0.29\textwidth} p{0.32\textwidth} p{0.13\textwidth}}
+\hline
+Algorithm & trainable parameters & architecture & optimization settings & activations \\
+\hline
+1 & 357,280 & $E$: 784--192--96--32; $D$: 32--96--192--784; $G$: 48--48--48--32; label embedding 16 & $T=2$, $r=200$, $\lambda_{KL}=10^{-5}$, $\lambda_d=30$, $\lambda_v=.1$, $\lambda_c=.3$, AdamW $10^{-3}$ & LeakyReLU encoder/decoder, SiLU generator, Sigmoid output \\
+2 & 357,280 total; VAE 348,560, $G$ 8,720 & Same VAE and generator as Algorithm 1; VAE frozen in Stage II & $T=2$, $r=200$, same loss weights; 100 VAE epochs then 100 generator epochs, AdamW $10^{-3}$ & LeakyReLU, SiLU, Sigmoid \\
+3 & 357,280 & Same VAE and generator; generated path includes $G\to D\to\mu$ & $T=2$, $r=200$, same loss weights; AdamW $10^{-3}$ & LeakyReLU, SiLU, Sigmoid \\
+4 & 357,280 main model + 7,457 discriminator & Algorithm 1 model plus $D_\omega$: 48--64--64--1 with label embedding 16 & $T=2$, $r=200$, $\lambda_{adv}=1$, model/discriminator LR $10^{-3}$ & LeakyReLU discriminator; BCE-with-logits \\
+5 & 357,280 & Same VAE and generator; deterministic $\mu$ cache; raw and re-encoded drift & 25 VAE pretraining epochs, then 100 joint epochs; $T=2$, $r=200$, $\lambda_{L1}=0$, AdamW $10^{-3}$ & LeakyReLU, SiLU, Sigmoid \\
+\hline
+\end{tabular}
+\end{table}
+
+\section*{Saved generated MNIST outputs}
+
+Each figure reproduces the embedded notebook output.  The rows are labelled
+by the notebook as real images, reconstructions, and generated samples when
+all three rows are present.
+
+\begin{figure}[htbp]\centering\asset{algorithm1_digits.png}
+\caption{Algorithm 1 saved MNIST output.}\end{figure}
+\begin{figure}[htbp]\centering\asset{algo2_digits.png}
+\caption{Algorithm 2 saved MNIST output.}\end{figure}
+\begin{figure}[htbp]\centering\asset{algo3_digits.png}
+\caption{Algorithm 3 saved MNIST output.}\end{figure}
+\begin{figure}[htbp]\centering\asset{algo4_digits.png}
+\caption{Algorithm 4 saved MNIST output.}\end{figure}
+\begin{figure}[htbp]\centering\asset{algo5_digits.png}
+\caption{Algorithm 5 saved MNIST output.}\end{figure}
+
+\section*{PCA and UMAP projections}
+
+The first projection for each algorithm uses digit labels; the second uses a
+binary real-versus-generated label.  These are visual diagnostics rather than
+numeric scores.  The saved Algorithm 1 figures show an empty UMAP panel,
+consistent with the previously reported UMAP environment problem; the other
+notebooks contain rendered PCA/UMAP panels.
+
+\begin{figure}[htbp]\centering\asset{algorithm1_projection_1.png}
+\caption{Algorithm 1 PCA/UMAP projection colored by digit.}\end{figure}
+\begin{figure}[htbp]\centering\asset{algorithm1_projection_2.png}
+\caption{Algorithm 1 PCA/UMAP projection colored by real/generated source.}\end{figure}
+\begin{figure}[htbp]\centering\asset{algo2_projection_1.png}
+\caption{Algorithm 2 PCA/UMAP projection colored by digit.}\end{figure}
+\begin{figure}[htbp]\centering\asset{algo2_projection_2.png}
+\caption{Algorithm 2 PCA/UMAP projection colored by real/generated source.}\end{figure}
+\begin{figure}[htbp]\centering\asset{algo3_projection_1.png}
+\caption{Algorithm 3 PCA/UMAP projection colored by digit.}\end{figure}
+\begin{figure}[htbp]\centering\asset{algo3_projection_2.png}
+\caption{Algorithm 3 PCA/UMAP projection colored by real/generated source.}\end{figure}
+\begin{figure}[htbp]\centering\asset{algo4_projection_1.png}
+\caption{Algorithm 4 PCA/UMAP projection colored by digit.}\end{figure}
+\begin{figure}[htbp]\centering\asset{algo4_projection_2.png}
+\caption{Algorithm 4 PCA/UMAP projection colored by real/generated source.}\end{figure}
+\begin{figure}[htbp]\centering\asset{algo5_projection_1.png}
+\caption{Algorithm 5 PCA/UMAP projection colored by digit.}\end{figure}
+\begin{figure}[htbp]\centering\asset{algo5_projection_2.png}
+\caption{Algorithm 5 PCA/UMAP projection colored by real/generated source.}\end{figure}
+
+\section*{Gradient-flow diagrams}
+
+The current \texttt{formulations.tex} contains the combined gradient-flow
+diagram for Algorithms 1--3.  It is included below as page 3 of its compiled
+PDF.  The source file does not currently contain separate Algorithm 4 and
+Algorithm 5 diagrams, so their flow diagrams are included immediately after
+it using the computation graphs implemented in their notebooks.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[page=3,width=0.98\textwidth]{formulations.pdf}
+\caption{Gradient-flow diagram for Algorithms 1--3, included from the compiled \texttt{formulations.tex}.}
+\end{figure}
+
+\subsection*{Algorithm 4 flow}
+
+\begin{figure}[htbp]
+\centering
+\[
+\begin{array}{ccccc}
+(x,c)&\xrightarrow{q_\phi}&z^+&\xrightarrow{D_\psi}&\mathcal L_{\rm recon}+\lambda_{\rm KL}\mathcal L_{\rm KL}\\[2mm]
+(\varepsilon,c)&\xrightarrow{G_\theta}&z^-&\xrightarrow{\ \mathcal L_{\rm drift,var,cov}\ }&\boxed{\nabla_{\phi,\psi,\theta}\ \text{update}}\\[2mm]
+\multicolumn{2}{c}{\operatorname{sg}(z^+),\operatorname{sg}(z^-)}&\xrightarrow{D_\omega}&\mathcal L_{\rm disc}\ \text{(detached)}&\\[2mm]
+z^-&\xrightarrow{D_\omega\ \text{with frozen }\omega}&\mathcal L_{\rm adv}&\xrightarrow{\ \text{gradient to }\theta\ }&\boxed{\text{update}}
+\end{array}
+\]
+\caption{Algorithm 4 adds a detached discriminator-training path and an adversarial gradient path to the generator.}
+\end{figure}
+
+\subsection*{Algorithm 5 flow}
+
+\begin{figure}[htbp]
+\centering
+\[
+\begin{array}{ccccc}
+x&\xrightarrow{q_\phi}&\mu&\xrightarrow{D_\psi}&\mathcal L_{\rm recon}+\lambda_{\rm KL}\mathcal L_{\rm KL}\quad\text{(25-epoch pretraining)}\\[2mm]
+\mu&\xrightarrow{\text{deterministic}}&\text{fixed class cache}&&\\[2mm]
+(x,c)&\xrightarrow{q_\phi}&z^+&\xrightarrow{D_\psi}&\mathcal L_{\rm recon}+\lambda_{\rm KL}\mathcal L_{\rm KL}\\[2mm]
+(\varepsilon,c)&\xrightarrow{G_\theta}&z_{\rm raw}&\xrightarrow{D_\psi,\ \mu_\phi}&\widetilde z^-&\\[2mm]
+z_{\rm raw},\widetilde z^-&\xrightarrow{\ \frac12(\mathcal L_{\rm drift}^{\rm raw}+\mathcal L_{\rm drift}^{\rm reenc})\ }&&&\boxed{\nabla_{\phi,\psi,\theta}\ \text{fully joint update}}
+\end{array}
+\]
+\caption{Algorithm 5 first stabilizes the VAE and deterministic cache, then combines raw-latent and re-encoded drift during fully joint training.}
+\end{figure}
+
+\end{document}
