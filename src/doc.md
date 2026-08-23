@@ -20,11 +20,11 @@ Unless noted otherwise, feature and latent matrices use shape
 | --- | --- | --- |
 | `sliced_wasserstein_distance(real, generated, n_projections=128, n_quantiles=256, p=1, random_state=0)` | Compare two feature distributions with random 1-D projections. | `float` |
 | `mmd_rbf(real, generated, bandwidth=None, max_samples=2048, random_state=0)` | Compare distributions with an RBF-kernel MMD score. | `float` |
-| `frechet_distance(real_features, generated_features, eps=1e-6)` | Compute FID-style distance from precomputed features. Do not pass raw images. | `float` |
+| `frechet_distance(real_features, generated_features, eps=1e-6)` | Compute FID-style distance from a common feature space. On raw pixels, interpret it only as a pixel-space Fréchet distance. | `float` |
 | `fid(real_features, generated_features, eps=1e-6)` | Alias for `frechet_distance`. | `float` |
 | `class_coverage(labels, n_classes=None, min_count=1)` | Fraction of classes represented at least `min_count` times. | `float` in `[0, 1]` |
 | `class_entropy(labels_or_probabilities, n_classes=None, normalized=True)` | Diversity of generated class frequencies. Accepts labels or an `(n_samples, n_classes)` probability matrix. | `float` |
-| `evaluate_generation(real_features, generated_features, generated_labels=None, ...)` | Run SWD, MMD, FID, and optional class metrics together. | `dict[str, float]` |
+| `evaluate_generation(real_features, generated_features, generated_labels=None, ..., include_mmd=True, include_fid=True)` | Run SWD, optional MMD/FID, and optional class metrics together. | `dict[str, float]` |
 
 Example:
 
@@ -39,6 +39,25 @@ metrics = evaluate_generation(
 
 Use the same fixed feature extractor for `real_features` and
 `generated_features` before calling the distribution metrics.
+
+### One-call post-training evaluation
+
+| Function | Use | Returns |
+| --- | --- | --- |
+| `collect_latent_samples(model, loader, ...)` | Collect deterministic real encoder means, conditional generated latents, images, and labels. | dictionary of NumPy arrays |
+| `latent_statistics(real_latents, generated_latents, factors=None)` | Compare latent mean, standard deviation, total correlation, and optional real MIG. | `dict[str, float]` |
+| `evaluate_latent_model(model, loader, ...)` | Collect samples and compute the standard latent-space metrics in one call. | dictionary with `samples`, `metrics`, and `statistics` |
+| `evaluate_per_class_generation(...)` | Run a chosen feature metric separately for each non-empty internal class. | `dict[int, dict[str, float]]` |
+
+For the filtered MNIST notebooks, use:
+
+```python
+post_eval = evaluate_latent_model(
+    f_trained, test_loader, device=device,
+    n_classes=NUM_CLASSES, class_to_label=CLASS_TO_DIGIT,
+    n_samples=2048, include_mmd=False,
+)
+```
 
 ### Latent metrics
 
@@ -60,8 +79,9 @@ disentanglement without them.
 | `umap_embedding(latents, n_components=2, n_neighbors=15, min_dist=0.1, metric="euclidean", random_state=0, **kwargs)` | Project latents with optional `umap-learn`. | embedding array |
 | `plot_loss_history(history, keys=(...), log_scale=True, figsize=(10, 14))` | Plot training-loss histories. | `(figure, axes)` |
 | `plot_embedding(embedding, labels=None, ax=None, title=None, point_size=12.0, alpha=0.7)` | Scatter a two-column PCA/UMAP embedding. | `Axes` |
-| `plot_latent_correlation(latents, ax=None, annotate=False, figsize=(7, 6))` | Plot latent-dimension Pearson correlations. | `(figure, ax, correlation)` |
 | `plot_latent_projections(latents, labels=None, methods=("pca", "umap"), figsize=(12, 5))` | Plot PCA and/or UMAP views. | `(figure, axes)` |
+| `plot_real_generated_projections(real_latents, generated_latents, ...)` | Make PCA/UMAP plots colored by digit and by real/generated source. | dictionary of `(figure, axes)` pairs |
+| `plot_conditional_mnist_results(model, loader, ...)` | Show real MNIST inputs, reconstructions, and conditional generations. | `(figure, axes)` |
 
 Examples:
 
@@ -81,6 +101,25 @@ The underscore-prefixed functions in `eval.py` (`_to_numpy`, `_as_2d`,
 `_labels_to_codes`, `_discretize`, `_entropy_from_codes`, and
 `_import_matplotlib`) are implementation details. Call the public functions
 above instead.
+
+## Training helpers
+
+Import with:
+
+```python
+from src.training import compose_objective, gradient_report, per_loss_gradient_norms
+```
+
+| Function | Use |
+| --- | --- |
+| `compose_objective(losses, weights, lambda_representation=1.0, loss_scale=1.0)` | Build the differentiable total loss and a report of raw, weighted, and actual contribution values. `lambda_representation` scales reconstruction/KL/variance/covariance as one group relative to drift or adversarial terms. |
+| `format_epoch_losses(losses, weights, ...)` | Print raw and weighted epoch-average losses in the same convention as `compose_objective`. |
+| `gradient_report(loss, model)` | Show which encoder, decoder, generator, or other parameters receive gradient from one loss. |
+| `per_loss_gradient_norms(losses, model, weights, ...)` | Compare the weighted gradient norm of each loss term by model component. |
+
+Leave `loss_scale=1.0` unless you are deliberately testing a global gradient
+multiplier. It changes the gradient just like changing the learning rate; a
+larger displayed scalar loss is not inherently easier to optimize.
 
 ## Drift loss helpers
 
@@ -114,9 +153,10 @@ loss, parts = total_loss(
 loss.backward()
 ```
 
-`parts` contains `recon`, `kl`, `drift`, `V`, `var`, and `covar`. Adjust
-`lambda_kl`, `lambda_drift`, `lambda_var`, and `lambda_cov` to change the
-relative contribution of each term.
+`parts` contains `recon`, `kl`, `drift`, `V`, `var`, `covar`, and the grouped
+representation terms. Adjust `lambda_kl`, `lambda_drift`, `lambda_var`,
+`lambda_cov`, and optionally `lambda_representation` to change relative
+contributions.
 
 ## DriftXpress helpers
 

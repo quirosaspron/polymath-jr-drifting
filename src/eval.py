@@ -176,72 +176,6 @@ def _entropy_from_codes(codes: np.ndarray) -> float:
     return float(-np.sum(probabilities * np.log(probabilities + 1e-12)))
 
 
-def gradient_report(
-    loss: Any,
-    model: Any,
-    tolerance: float = 1e-12,
-) -> dict[str, dict[str, float | int]]:
-    """Report gradient flow for a scalar PyTorch loss by model component."""
-    try:
-        import torch
-    except ImportError as exc:
-        raise ImportError("gradient_report requires PyTorch.") from exc
-
-    if not isinstance(loss, torch.Tensor) or loss.ndim != 0:
-        raise ValueError("loss must be a scalar PyTorch tensor.")
-    if not loss.requires_grad:
-        raise ValueError("loss must require gradients; use the raw loss before detaching it.")
-
-    def collect(*names: str) -> list[Any]:
-        parameters = []
-        seen = set()
-        for name in names:
-            module = getattr(model, name, None)
-            if module is None or not hasattr(module, "parameters"):
-                continue
-            for parameter in module.parameters():
-                if parameter.requires_grad and id(parameter) not in seen:
-                    parameters.append(parameter)
-                    seen.add(id(parameter))
-        return parameters
-
-    groups = {
-        "encoder": collect("encoder", "fc_mu", "fc_var"),
-        "decoder": collect("decoder_input", "decoder"),
-        "generator": collect("generator"),
-    }
-
-    assigned = {id(p) for group in groups.values() for p in group}
-    other = [p for p in model.parameters() if p.requires_grad and id(p) not in assigned]
-    if other:
-        groups["other"] = other
-
-    report = {}
-    for name, parameters in groups.items():
-        if not parameters:
-            report[name] = {
-                "total_norm": 0.0,
-                "nonzero_parameters": 0,
-                "parameter_count": 0,
-            }
-            continue
-
-        gradients = torch.autograd.grad(
-            loss, parameters, retain_graph=True, allow_unused=True
-        )
-        norms = [
-            0.0 if gradient is None else float(gradient.detach().norm().item())
-            for gradient in gradients
-        ]
-        report[name] = {
-            "total_norm": float(sum(norms)),
-            "nonzero_parameters": int(sum(n > tolerance for n in norms)),
-            "parameter_count": len(parameters),
-        }
-
-    return report
-
-
 def _import_matplotlib():
     try:
         import matplotlib.pyplot as plt
@@ -774,8 +708,10 @@ def evaluate_generation(
     random_state: int | None = 0,
     n_projections: int = 128,
     mmd_max_samples: int | None = 2048,
+    include_mmd: bool = True,
+    include_fid: bool = True,
 ) -> dict[str, float]:
-    """Compute SWD, MMD, FID, and optional class metrics."""
+    """Compute SWD, optional MMD/FID, and optional class metrics."""
     metrics = {
         "sliced_wasserstein": sliced_wasserstein_distance(
             real_features,
@@ -783,14 +719,16 @@ def evaluate_generation(
             n_projections=n_projections,
             random_state=random_state,
         ),
-        "mmd_rbf": mmd_rbf(
+    }
+    if include_mmd:
+        metrics["mmd_rbf"] = mmd_rbf(
             real_features,
             generated_features,
             max_samples=mmd_max_samples,
             random_state=random_state,
-        ),
-        "fid": frechet_distance(real_features, generated_features),
-    }
+        )
+    if include_fid:
+        metrics["fid"] = frechet_distance(real_features, generated_features)
 
     if generated_labels is not None:
         metrics["class_coverage"] = class_coverage(
@@ -804,6 +742,228 @@ def evaluate_generation(
             normalized=True,
         )
     return metrics
+
+
+# ---------------------------------------------------------------------------
+# Reusable VAE collection and evaluation
+# ---------------------------------------------------------------------------
+
+def collect_latent_samples(
+    model: Any,
+    data_loader: Any,
+    *,
+    device: Any | None = None,
+    n_samples: int | None = None,
+    n_classes: int | None = None,
+    class_to_label: Any | None = None,
+    random_state: int | None = 0,
+) -> dict[str, np.ndarray]:
+    """Collect real encoder means and equally many conditional generations.
+
+    The loader must yield ``(images, class_ids)``.  ``class_ids`` are the
+    model's internal labels; ``class_to_label`` optionally maps them back to
+    original digit labels for plots.  Returned arrays are CPU NumPy arrays.
+    """
+    try:
+        import torch
+    except ImportError as exc:
+        raise ImportError("collect_latent_samples requires PyTorch.") from exc
+
+    if n_samples is not None and n_samples < 1:
+        raise ValueError("n_samples must be positive or None.")
+    if n_classes is None:
+        n_classes = getattr(model, "num_classes", None)
+    if n_classes is None or int(n_classes) < 1:
+        raise ValueError("Pass n_classes or give the model a positive num_classes.")
+    n_classes = int(n_classes)
+
+    if device is None:
+        try:
+            target_device = next(model.parameters()).device
+        except StopIteration:
+            target_device = torch.device("cpu")
+    else:
+        target_device = torch.device(device)
+
+    was_training = bool(getattr(model, "training", False))
+    real_latent_batches = []
+    real_image_batches = []
+    real_class_batches = []
+    collected = 0
+
+    model.eval()
+    with torch.no_grad():
+        for images, class_ids in data_loader:
+            if n_samples is not None and collected >= n_samples:
+                break
+            images = images.to(target_device, non_blocking=True).flatten(start_dim=1)
+            class_ids = class_ids.to(target_device, non_blocking=True).long()
+            take = images.shape[0]
+            if n_samples is not None:
+                take = min(take, n_samples - collected)
+            if take <= 0:
+                break
+            images = images[:take]
+            class_ids = class_ids[:take]
+            mu, _, _ = model.get_latent(images)
+            real_latent_batches.append(mu.cpu())
+            real_image_batches.append(images.cpu())
+            real_class_batches.append(class_ids.cpu())
+            collected += take
+
+        if not real_latent_batches:
+            raise ValueError("data_loader did not yield any samples.")
+
+        total = int(sum(batch.shape[0] for batch in real_latent_batches))
+        generator = None
+        if random_state is not None:
+            generator = torch.Generator(device=target_device).manual_seed(random_state)
+        noise = torch.randn(
+            total,
+            int(model.latent_dim),
+            device=target_device,
+            generator=generator,
+        )
+        generated_class_ids = torch.randint(
+            0,
+            n_classes,
+            (total,),
+            device=target_device,
+            generator=generator,
+        )
+        generated_latents, generated_images = model.generate(noise, generated_class_ids)
+
+    if was_training:
+        model.train()
+
+    real_class_ids = torch.cat(real_class_batches).numpy()
+    generated_class_ids_array = generated_class_ids.cpu().numpy()
+    label_lookup = None if class_to_label is None else _to_numpy(class_to_label)
+    if label_lookup is not None:
+        if label_lookup.ndim != 1 or label_lookup.shape[0] < n_classes:
+            raise ValueError("class_to_label must map every internal class id.")
+        real_labels = label_lookup[real_class_ids]
+        generated_labels = label_lookup[generated_class_ids_array]
+    else:
+        real_labels = real_class_ids.copy()
+        generated_labels = generated_class_ids_array.copy()
+
+    return {
+        "real_latents": torch.cat(real_latent_batches).numpy(),
+        "generated_latents": generated_latents.cpu().numpy(),
+        "real_images": torch.cat(real_image_batches).numpy(),
+        "generated_images": generated_images.cpu().numpy(),
+        "real_class_ids": real_class_ids,
+        "generated_class_ids": generated_class_ids_array,
+        "real_labels": np.asarray(real_labels),
+        "generated_labels": np.asarray(generated_labels),
+    }
+
+
+def latent_statistics(
+    real_latents: Any,
+    generated_latents: Any,
+    *,
+    factors: Any | None = None,
+) -> dict[str, float]:
+    """Summarize latent location, scale, and optional disentanglement scores."""
+    real_array, generated_array = _check_pair(real_latents, generated_latents)
+    statistics = {
+        "real_latent_mean": float(real_array.mean()),
+        "generated_latent_mean": float(generated_array.mean()),
+        "real_latent_std": float(real_array.std(axis=0).mean()),
+        "generated_latent_std": float(generated_array.std(axis=0).mean()),
+        "generated_to_real_std_ratio": float(
+            generated_array.std(axis=0).mean()
+            / max(real_array.std(axis=0).mean(), 1e-12)
+        ),
+        "real_total_correlation": total_correlation(real_array),
+        "generated_total_correlation": total_correlation(generated_array),
+    }
+    if factors is not None:
+        statistics["real_mig"] = mutual_information_gap(real_array, factors)
+    return statistics
+
+
+def evaluate_latent_model(
+    model: Any,
+    data_loader: Any,
+    *,
+    device: Any | None = None,
+    n_samples: int | None = None,
+    n_classes: int | None = None,
+    class_to_label: Any | None = None,
+    random_state: int | None = 0,
+    n_projections: int = 128,
+    include_mmd: bool = False,
+    include_fid: bool = True,
+) -> dict[str, Any]:
+    """Run the common latent-space post-training evaluation in one call.
+
+    The returned ``metrics['fid']`` is Fréchet distance in latent space.  For
+    image FID with a frozen MNIST evaluator, use :func:`evaluate_mnist_generation`.
+    """
+    samples = collect_latent_samples(
+        model,
+        data_loader,
+        device=device,
+        n_samples=n_samples,
+        n_classes=n_classes,
+        class_to_label=class_to_label,
+        random_state=random_state,
+    )
+    metrics = evaluate_generation(
+        samples["real_latents"],
+        samples["generated_latents"],
+        generated_labels=samples["generated_class_ids"],
+        n_classes=n_classes,
+        random_state=random_state,
+        n_projections=n_projections,
+        include_mmd=include_mmd,
+        include_fid=include_fid,
+    )
+    return {
+        "samples": samples,
+        "metrics": metrics,
+        "statistics": latent_statistics(
+            samples["real_latents"],
+            samples["generated_latents"],
+        ),
+    }
+
+
+def evaluate_per_class_generation(
+    real_features: Any,
+    generated_features: Any,
+    real_class_ids: Any,
+    generated_class_ids: Any,
+    *,
+    n_classes: int,
+    **metric_kwargs: Any,
+) -> dict[int, dict[str, float]]:
+    """Compute the same feature metrics separately for each non-empty class."""
+    real_array, generated_array = _check_pair(real_features, generated_features)
+    real_ids = _to_numpy(real_class_ids).reshape(-1).astype(int)
+    generated_ids = _to_numpy(generated_class_ids).reshape(-1).astype(int)
+    if real_ids.shape[0] != real_array.shape[0]:
+        raise ValueError("real_class_ids must match real_features.")
+    if generated_ids.shape[0] != generated_array.shape[0]:
+        raise ValueError("generated_class_ids must match generated_features.")
+    if n_classes < 1:
+        raise ValueError("n_classes must be positive.")
+
+    results: dict[int, dict[str, float]] = {}
+    for class_id in range(n_classes):
+        real_mask = real_ids == class_id
+        generated_mask = generated_ids == class_id
+        if real_mask.sum() < 2 or generated_mask.sum() < 2:
+            continue
+        results[class_id] = evaluate_generation(
+            real_array[real_mask],
+            generated_array[generated_mask],
+            **metric_kwargs,
+        )
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -1030,72 +1190,6 @@ def plot_embedding(
     return ax
 
 
-def plot_latent_correlation(
-    latents: Any,
-    ax: Any | None = None,
-    annotate: bool = False,
-    figsize: tuple[float, float] = (7.0, 6.0),
-):
-    """Plot the Pearson correlation matrix between latent dimensions.
-
-    annotate=True is useful for small latent spaces. For large latent spaces,
-    the heatmap is clearer without numbers in every cell.
-    """
-    plt = _import_matplotlib()
-    latent_array = _as_2d(latents, "latents")
-    centered = latent_array - latent_array.mean(axis=0, keepdims=True)
-    covariance = centered.T @ centered / max(1, centered.shape[0] - 1)
-    standard_deviations = np.sqrt(np.clip(np.diag(covariance), 0.0, None))
-    denominator = np.outer(standard_deviations, standard_deviations)
-    correlation = np.divide(
-        covariance,
-        denominator,
-        out=np.zeros_like(covariance),
-        where=denominator > 1e-12,
-    )
-    correlation = np.clip(correlation, -1.0, 1.0)
-    np.fill_diagonal(correlation, 1.0)
-
-    if ax is None:
-        figure, ax = plt.subplots(figsize=figsize)
-    else:
-        figure = ax.figure
-
-    image = ax.imshow(correlation, cmap="coolwarm", vmin=-1.0, vmax=1.0)
-    figure.colorbar(image, ax=ax, label="Pearson correlation")
-    ax.set_title("Latent-dimension correlation")
-    ax.set_xlabel("Latent dimension")
-    ax.set_ylabel("Latent dimension")
-
-    dimension = correlation.shape[0]
-    if dimension <= 30:
-        ticks = np.arange(dimension)
-        ax.set_xticks(ticks)
-        ax.set_yticks(ticks)
-    else:
-        step = max(1, dimension // 10)
-        ticks = np.arange(0, dimension, step)
-        ax.set_xticks(ticks)
-        ax.set_yticks(ticks)
-
-    if annotate and dimension <= 20:
-        for row in range(dimension):
-            for column in range(dimension):
-                color = "white" if abs(correlation[row, column]) > 0.5 else "black"
-                ax.text(
-                    column,
-                    row,
-                    f"{correlation[row, column]:.2f}",
-                    ha="center",
-                    va="center",
-                    color=color,
-                    fontsize=8,
-                )
-
-    figure.tight_layout()
-    return figure, ax, correlation
-
-
 def plot_latent_projections(
     latents: Any,
     labels: Any | None = None,
@@ -1122,6 +1216,98 @@ def plot_latent_projections(
     return figure, axes
 
 
+def plot_real_generated_projections(
+    real_latents: Any,
+    generated_latents: Any,
+    *,
+    real_labels: Any | None = None,
+    generated_labels: Any | None = None,
+    methods: Sequence[str] = ("pca", "umap"),
+) -> dict[str, tuple[Any, Any]]:
+    """Plot latent views by digit (when supplied) and always by source."""
+    real_array, generated_array = _check_pair(real_latents, generated_latents)
+    combined = np.concatenate([real_array, generated_array], axis=0)
+    source_labels = np.concatenate([
+        np.zeros(len(real_array), dtype=int),
+        np.ones(len(generated_array), dtype=int),
+    ])
+    figures: dict[str, tuple[Any, Any]] = {
+        "by_source": plot_latent_projections(
+            combined,
+            labels=source_labels,
+            methods=methods,
+        )
+    }
+    if real_labels is not None and generated_labels is not None:
+        figures["by_label"] = plot_latent_projections(
+            combined,
+            labels=np.concatenate([
+                _to_numpy(real_labels).reshape(-1),
+                _to_numpy(generated_labels).reshape(-1),
+            ]),
+            methods=methods,
+        )
+    return figures
+
+
+def plot_conditional_mnist_results(
+    model: Any,
+    data_loader: Any,
+    *,
+    device: Any | None = None,
+    samples: int = 10,
+    use_mean_for_reconstruction: bool = True,
+):
+    """Show real inputs, reconstructions, and label-conditioned generations."""
+    try:
+        import torch
+    except ImportError as exc:
+        raise ImportError("plot_conditional_mnist_results requires PyTorch.") from exc
+
+    if samples < 1:
+        raise ValueError("samples must be positive.")
+    plt = _import_matplotlib()
+    if device is None:
+        target_device = next(model.parameters()).device
+    else:
+        target_device = torch.device(device)
+    images, labels = next(iter(data_loader))
+    images = images[:samples].to(target_device).flatten(start_dim=1)
+    labels = labels[:samples].to(target_device).long()
+    if images.shape[0] == 0:
+        raise ValueError("data_loader yielded an empty batch.")
+
+    was_training = bool(getattr(model, "training", False))
+    model.eval()
+    with torch.no_grad():
+        mu, _, z = model.get_latent(images)
+        reconstruction_latents = mu if use_mean_for_reconstruction else z
+        reconstructions = model.decode(reconstruction_latents)
+        noise = torch.randn(images.shape[0], model.latent_dim, device=target_device)
+        _, generated = model.generate(noise, labels)
+    if was_training:
+        model.train()
+
+    count = images.shape[0]
+    figure, axes = plt.subplots(3, count, figsize=(1.5 * count, 4.8), squeeze=False)
+    rows = (images, reconstructions, generated)
+    for row, values in enumerate(rows):
+        for column in range(count):
+            axes[row, column].imshow(
+                values[column].detach().cpu().reshape(28, 28),
+                cmap="gray",
+                vmin=0.0,
+                vmax=1.0,
+            )
+            axes[row, column].axis("off")
+    axes[0, 0].set_ylabel("real")
+    axes[1, 0].set_ylabel("recon")
+    axes[2, 0].set_ylabel("generated")
+    figure.suptitle("Rows: real MNIST | reconstructions | conditional generations")
+    figure.tight_layout()
+    return figure, axes
+
+
 __all__ = [
     "sliced_wasserstein_distance",
     "mmd_rbf",
@@ -1134,7 +1320,10 @@ __all__ = [
     "class_coverage",
     "class_entropy",
     "evaluate_generation",
-    "gradient_report",
+    "collect_latent_samples",
+    "latent_statistics",
+    "evaluate_latent_model",
+    "evaluate_per_class_generation",
     "mutual_information",
     "mutual_information_gap",
     "total_correlation",
@@ -1142,6 +1331,7 @@ __all__ = [
     "umap_embedding",
     "plot_loss_history",
     "plot_embedding",
-    "plot_latent_correlation",
     "plot_latent_projections",
+    "plot_real_generated_projections",
+    "plot_conditional_mnist_results",
 ]

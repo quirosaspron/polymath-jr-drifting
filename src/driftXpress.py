@@ -104,6 +104,7 @@ def total_loss(
     lambda_drift=1.0,
     lambda_var=0.1,
     lambda_cov=0.1,
+    lambda_representation=1.0,
 ):
     L_recon = recon_loss(y_pos_recon, y_pos)
     L_kl = kl_loss(y_pos_mu, y_pos_logvar)
@@ -112,13 +113,13 @@ def total_loss(
     )
     L_var =  variance_loss(y_pos_mu) + variance_loss(y_neg_latent)
     L_cov = covariance_loss(y_pos_mu) + covariance_loss(y_neg_latent)
-    total = (
+    representation = (
         L_recon
         + lambda_kl * L_kl
-        + lambda_drift * L_drift
         + lambda_var * L_var
         + lambda_cov * L_cov
     )
+    total = lambda_representation * representation + lambda_drift * L_drift
     loss_items = {
         "recon": L_recon.detach(),
         "kl": L_kl.detach(),
@@ -126,5 +127,7 @@ def total_loss(
         "V": V.detach(),
         "var": L_var.detach(),
         "covar": L_cov.detach(),
+        "representation": representation.detach(),
+        "representation_scaled": (lambda_representation * representation).detach(),
     }
     return total, loss_items

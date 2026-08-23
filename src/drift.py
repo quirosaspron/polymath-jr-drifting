@@ -66,15 +66,19 @@ def covariance_loss(latents):
     return off_diag.pow(2).sum() / dim
 
 def total_loss(y_pos_recon, y_pos, y_pos_mu, y_pos_logvar, y_neg_latent, y_pos_latent,temp,
-                lambda_kl=0.01, lambda_drift=1.0, lambda_var=0.1, lambda_cov=0.1):
+                lambda_kl=0.01, lambda_drift=1.0, lambda_var=0.1, lambda_cov=0.1,
+                lambda_representation=1.0):
     L_recon = recon_loss(y_pos_recon, y_pos)
     L_kl    = kl_loss(y_pos_mu, y_pos_logvar)
     L_drift, V = drift_loss(y_neg_latent, y_pos_latent, temp)
     L_var   = variance_loss(y_pos_mu) + variance_loss(y_neg_latent)
     L_cov = covariance_loss(y_pos_mu) + covariance_loss(y_neg_latent)
-    total = L_recon + lambda_kl*L_kl + lambda_drift*L_drift + lambda_var*L_var + lambda_cov*L_cov
+    representation = L_recon + lambda_kl*L_kl + lambda_var*L_var + lambda_cov*L_cov
+    total = lambda_representation * representation + lambda_drift * L_drift
     loss_items = {"recon": L_recon.detach(), "kl": L_kl.detach(),
-                    "drift": L_drift.detach(), "V": V.detach(),"var": L_var.detach(), "covar":L_cov.detach()}
+                    "drift": L_drift.detach(), "V": V.detach(),"var": L_var.detach(), "covar":L_cov.detach(),
+                    "representation": representation.detach(),
+                    "representation_scaled": (lambda_representation * representation).detach()}
     return total, loss_items
 
 
