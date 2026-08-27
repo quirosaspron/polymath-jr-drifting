@@ -897,11 +897,15 @@ def evaluate_latent_model(
     n_projections: int = 128,
     include_mmd: bool = False,
     include_fid: bool = True,
+    evaluator: Any | None = None,
+    evaluator_batch_size: int = 1024,
 ) -> dict[str, Any]:
     """Run the common latent-space post-training evaluation in one call.
 
     The returned ``metrics['fid']`` is Fréchet distance in latent space.  For
-    image FID with a frozen MNIST evaluator, use :func:`evaluate_mnist_generation`.
+    image FID with a frozen MNIST evaluator, pass it through ``evaluator``.
+    This also adds classifier-based conditional accuracy, predicted class
+    coverage/entropy, and learned-feature FID to the returned metrics.
     """
     samples = collect_latent_samples(
         model,
@@ -912,16 +916,32 @@ def evaluate_latent_model(
         class_to_label=class_to_label,
         random_state=random_state,
     )
+    feature_labels = (
+        None if evaluator is not None else samples["generated_class_ids"]
+    )
     metrics = evaluate_generation(
         samples["real_latents"],
         samples["generated_latents"],
-        generated_labels=samples["generated_class_ids"],
+        generated_labels=feature_labels,
         n_classes=n_classes,
         random_state=random_state,
         n_projections=n_projections,
         include_mmd=include_mmd,
         include_fid=include_fid,
     )
+    if evaluator is not None:
+        metrics.update(
+            evaluate_mnist_generation(
+                samples["real_images"],
+                samples["generated_images"],
+                evaluator=evaluator,
+                real_labels=samples["real_class_ids"],
+                generated_labels=samples["generated_class_ids"],
+                n_classes=n_classes,
+                max_samples=n_samples,
+                evaluator_batch_size=evaluator_batch_size,
+            )
+        )
     return {
         "samples": samples,
         "metrics": metrics,
