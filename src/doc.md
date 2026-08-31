@@ -1,186 +1,236 @@
-# `src` function guide
+# `src` quick guide
 
-Short reference for the helpers in this folder. Use tensors with the drift
-helpers and NumPy arrays (or PyTorch tensors) with `eval.py`.
+The notebooks are the research frontend: hypothesis, configuration, figures,
+interpretation, and limitations. `src` holds reusable mechanics.
 
-## Evaluation helpers
+## Where things live
 
-Import with:
-
-```python
-from src.eval import evaluate_generation, plot_loss_history
-```
-
-Unless noted otherwise, feature and latent matrices use shape
-`(n_samples, n_features)`.
-
-### Distribution metrics
-
-| Function | Use | Returns |
+| Module | Status | What it provides |
 | --- | --- | --- |
-| `sliced_wasserstein_distance(real, generated, n_projections=128, n_quantiles=256, p=1, random_state=0)` | Compare two feature distributions with random 1-D projections. | `float` |
-| `mmd_rbf(real, generated, bandwidth=None, max_samples=2048, random_state=0)` | Compare distributions with an RBF-kernel MMD score. | `float` |
-| `frechet_distance(real_features, generated_features, eps=1e-6)` | Compute FID-style distance from a common feature space. On raw pixels, interpret it only as a pixel-space Fréchet distance. | `float` |
-| `fid(real_features, generated_features, eps=1e-6)` | Alias for `frechet_distance`. | `float` |
-| `class_coverage(labels, n_classes=None, min_count=1)` | Fraction of classes represented at least `min_count` times. | `float` in `[0, 1]` |
-| `class_entropy(labels_or_probabilities, n_classes=None, normalized=True)` | Diversity of generated class frequencies. Accepts labels or an `(n_samples, n_classes)` probability matrix. | `float` |
-| `evaluate_generation(real_features, generated_features, generated_labels=None, ..., include_mmd=True, include_fid=True)` | Run SWD, optional MMD/FID, and optional class metrics together. | `dict[str, float]` |
+| `drift.py` | Legacy; do not change | Exact identity-kernel field and existing losses used by old notebooks. |
+| `driftXpress.py` | Legacy; do not change | Existing identity-kernel Nyström/landmark approximation. |
+| `field.py` | Ready | Exact and DriftXpress-style fields with `representation=` support. |
+| `data.py` | Ready | Toy problems, MNIST loaders, and deterministic paired schedules. |
+| `eval.py` | Ready | SWD, MMD, Fréchet/FID-style metrics, MNIST evaluator, latent metrics, and plots. |
+| `evaluators.py` | Ready | Frozen checkpoint evaluators with fixed references and metric randomness. |
+| `toy.py` | Ready | Direct particle evolution and one-call raw-versus-known-signal comparison. |
+| `experiments.py` | Ready | Seeds, identical initialization, evolution snapshots, artifacts, paired comparisons, summaries. |
+| `diagnostics.py` | Ready | Hitting time, discrepancy AUC, fixed-budget score, field/kernel diagnostics, curve plots. |
+| `models/vae.py` | Ready | Ordinary MLP VAE moved out of the separate-training notebook. |
+| `models/generator.py` | Ready | Ordinary conditional latent generator. |
+| `models/phi.py` | Ready to modify | `PhiNetwork`: a small learned representation used by the drift kernel. |
+| `representation.py` | Partly user-owned | `compute_phi_loss` remains the research objective; supervised and health-check helpers are available. |
+| `trainers/loops.py` | **You implement** | A phi trainer and a fresh-generator trainer using frozen phi. |
+| `training.py` | Ready | Generic objective composition and gradient reports used by current notebooks. |
+| `matryoshka.py` | Existing specialized code | Matryoshka models, losses, trainers, and evaluation. |
 
-Example:
+Old notebooks can continue importing `src.drift`, `src.driftXpress`,
+`src.eval`, and `src.training`. The representation experiment uses the new
+modules and does not require changing the legacy ones.
+
+## Representation-aware fields
 
 ```python
-metrics = evaluate_generation(
-    real_features,
-    generated_features,
-    generated_labels=generated_labels,
-    n_classes=10,
+from src.field import (
+    build_differentiable_xpress_cache,
+    compute_exact_field,
+    build_xpress_cache,
+    compute_xpress_field,
 )
 ```
 
-Use the same fixed feature extractor for `real_features` and
-`generated_features` before calling the distribution metrics.
+The shared kernel is
 
-### One-call post-training evaluation
-
-| Function | Use | Returns |
-| --- | --- | --- |
-| `collect_latent_samples(model, loader, ...)` | Collect deterministic real encoder means, conditional generated latents, images, and labels. | dictionary of NumPy arrays |
-| `latent_statistics(real_latents, generated_latents, factors=None)` | Compare latent mean, standard deviation, total correlation, and optional real MIG. | `dict[str, float]` |
-| `evaluate_latent_model(model, loader, ...)` | Collect samples and compute the standard latent-space metrics in one call. | dictionary with `samples`, `metrics`, and `statistics` |
-| `evaluate_per_class_generation(...)` | Run a chosen feature metric separately for each non-empty internal class. | `dict[int, dict[str, float]]` |
-
-For the filtered MNIST notebooks, use:
-
-```python
-post_eval = evaluate_latent_model(
-    f_trained, test_loader, device=device,
-    n_classes=NUM_CLASSES, class_to_label=CLASS_TO_DIGIT,
-    n_samples=2048, include_mmd=False,
-)
+```text
+k_r(z1, z2) = exp(-distance(r(z1), r(z2)) / temperature)
 ```
 
-### Latent metrics
-
-| Function | Use | Returns |
-| --- | --- | --- |
-| `mutual_information(x, y, n_bins=20)` | Estimate MI after discretizing two variables. `x` and `y` must have the same sample count. | `float` |
-| `mutual_information_gap(latents, factors, n_bins=20, return_per_factor=False)` | Estimate MIG using known factors or labels. `latents` is `(n_samples, latent_dim)`; `factors` is `(n_samples,)` or `(n_samples, n_factors)`. | `float`, or result dict when requested |
-| `total_correlation(latents, eps=1e-6)` | Estimate dependence between latent dimensions using a Gaussian covariance approximation. | `float` |
-
-Lower `total_correlation` is better under its approximation. MIG requires
-meaningful observed factors or labels; it cannot infer semantic
-disentanglement without them.
-
-### Embeddings and plots
-
-| Function | Use | Returns |
-| --- | --- | --- |
-| `pca_embedding(latents, n_components=2)` | Project latents with NumPy-only PCA. | `(n_samples, n_components)` array |
-| `umap_embedding(latents, n_components=2, n_neighbors=15, min_dist=0.1, metric="euclidean", random_state=0, **kwargs)` | Project latents with optional `umap-learn`. | embedding array |
-| `plot_loss_history(history, keys=(...), log_scale=True, figsize=(10, 14))` | Plot training-loss histories. | `(figure, axes)` |
-| `plot_embedding(embedding, labels=None, ax=None, title=None, point_size=12.0, alpha=0.7)` | Scatter a two-column PCA/UMAP embedding. | `Axes` |
-| `plot_latent_projections(latents, labels=None, methods=("pca", "umap"), figsize=(12, 5))` | Plot PCA and/or UMAP views. | `(figure, axes)` |
-| `plot_real_generated_projections(real_latents, generated_latents, ...)` | Make PCA/UMAP plots colored by digit and by real/generated source. | dictionary of `(figure, axes)` pairs |
-| `plot_conditional_mnist_results(model, loader, ...)` | Show real MNIST inputs, reconstructions, and conditional generations. | `(figure, axes)` |
-
-Examples:
-
-```python
-embedding = pca_embedding(latents)
-ax = plot_embedding(embedding, labels=labels, title="Latent space")
-fig, axes = plot_loss_history(history)
-```
-
-`plot_loss_history` accepts keys such as `total`, `recon`, `kl`, `drift`,
-`var`, `covar`, and `force`; it also recognizes the notebook names
-`train_losses`, `recon_losses`, `kl_losses`, `drift_losses`, `var_losses`,
-`covar_losses`, and `average_V`.
-
-The underscore-prefixed functions in `eval.py` (`_to_numpy`, `_as_2d`,
-`_check_pair`, `_pairwise_squared_distances`, `_matrix_sqrt_psd`,
-`_labels_to_codes`, `_discretize`, `_entropy_from_codes`, and
-`_import_matplotlib`) are implementation details. Call the public functions
-above instead.
-
-## Training helpers
-
-Import with:
-
-```python
-from src.training import compose_objective, gradient_report, per_loss_gradient_norms
-```
+The representation changes kernel weights, but the returned vectors remain in
+the original latent coordinates.
 
 | Function | Use |
 | --- | --- |
-| `compose_objective(losses, weights, lambda_representation=1.0, loss_scale=1.0)` | Build the differentiable total loss and a report of raw, weighted, and actual contribution values. `lambda_representation` scales reconstruction/KL/variance/covariance as one group relative to drift or adversarial terms. |
-| `format_epoch_losses(losses, weights, ...)` | Print raw and weighted epoch-average losses in the same convention as `compose_objective`. |
-| `gradient_report(loss, model)` | Show which encoder, decoder, generator, or other parameters receive gradient from one loss. |
-| `per_loss_gradient_norms(losses, model, weights, ...)` | Compare the weighted gradient norm of each loss term by model component. |
+| `compute_exact_field(negative, positive, temperature=..., representation=...)` | Drop-in experimental counterpart to `drift.compute_V`. `representation=None` is the raw baseline. |
+| `compute_field_at_queries(queries, negative_reference=..., positive_reference=..., ...)` | Evaluate two independent field estimates at the same queries for diagnostics or a future direction-consistency loss. |
+| `build_xpress_cache(positive, landmark_indices=..., representation=..., ...)` | Build one cache after VAE and representation are frozen. |
+| `build_differentiable_xpress_cache(...)` | Training-only cache that preserves gradients through a changing phi; rebuild it after phi updates. |
+| `compute_xpress_field(negative, cache=..., representation=...)` | Evaluate the cached approximate field. |
+| `exponential_distance_kernel(x, y, representation=..., ...)` | Inspect the actual learned kernel weights. |
 
-Leave `loss_scale=1.0` unless you are deliberately testing a global gradient
-multiplier. It changes the gradient just like changing the learning rate; a
-larger displayed scalar loss is not inherently easier to optimize.
+Do not build a cache while phi changes. A changed representation makes the
+landmark kernel and positive summaries stale.
 
-## Drift loss helpers
-
-The intended import is:
-
-```python
-from src.drift import compute_V, total_loss
-```
-
-All latent inputs are 2-D tensors. `y_neg_latent` and `y_pos_latent` must
-share their feature dimension; batches may have different sizes.
-
-| Function | Use | Returns |
-| --- | --- | --- |
-| `softmax(logits, dim)` | Numerically stable softmax along `dim`. | tensor |
-| `compute_V(y_neg, y_pos, T, eps=1e-8)` | Compute the drift vector from negative and positive latent samples. | `(n_neg, latent_dim)` tensor |
-| `drift_loss(y_neg, y_pos, temp)` | Regress negative latents toward one detached drift step. | `(loss, V)` |
-| `recon_loss(y_pos_recon, y_pos)` | Mean-squared reconstruction loss. | scalar tensor |
-| `kl_loss(mu, logvar)` | Mean VAE KL loss over the batch. | scalar tensor |
-| `variance_loss(mu, gamma=1.5, eps=1e-4)` | VICReg-style penalty for low per-dimension variance. | scalar tensor |
-| `covariance_loss(latents)` | Penalize off-diagonal latent covariance. | scalar tensor |
-| `total_loss(y_pos_recon, y_pos, y_pos_mu, y_pos_logvar, y_neg_latent, y_pos_latent, temp, ...)` | Combine reconstruction, KL, drift, variance, and covariance losses. | `(total, loss_items)` |
-
-Typical training use:
+## Toy control
 
 ```python
-loss, parts = total_loss(
-    y_pos_recon, y_pos, y_pos_mu, y_pos_logvar,
-    y_neg_latent, y_pos_latent, temp=1.0,
+from src.data import make_toy_drift_problem
+from src.evaluators import make_toy_evaluator
+
+problem = make_toy_drift_problem(
+    n_samples=2048,
+    ambient_dim=32,
+    signal_dim=2,
+    rotate=False,
+    random_state=7,
 )
-loss.backward()
+
+raw_representation = None
+known_signal_representation = problem.project_signal
+evaluator = make_toy_evaluator(problem)
 ```
 
-`parts` contains `recon`, `kl`, `drift`, `V`, `var`, `covar`, and the grouped
-representation terms. Adjust `lambda_kl`, `lambda_drift`, `lambda_var`,
-`lambda_cov`, and optionally `lambda_representation` to change relative
-contributions.
+For the complete direct-particle gate, call `run_toy_particle_comparison`.
+The lower-level `run_particle_evolution` function is available when you want to
+inspect one condition manually.
 
-## DriftXpress helpers
+The target is an eight-blob signal plus nuisance coordinates. Initial and
+target particles share the same nuisance marginal, while their signal
+distributions differ. The evaluator reports:
 
-The functions in `driftXpress.py` are the landmark/Nyström approximation of
-the drift calculation:
+- `signal_swd` / `signal_mmd`: primary convergence measurements;
+- `observed_swd` / `observed_mmd`: full-data guardrails;
+- `nuisance_swd` / `nuisance_mmd`: whether drift damaged an already-correct marginal.
 
-| Function | Use | Returns |
-| --- | --- | --- |
-| `select_landmarks(y_pos, num_landmarks=128)` | Randomly select landmark rows. | landmark tensor |
-| `kzu(z, landmarks, T)` | Compute the exponential distance kernel. | kernel matrix |
-| `build_nystrom_cache(landmarks, T, jitter=1e-5)` | Build and cache the inverse square-root landmark kernel. | cache matrix |
-| `nystrom_map(z, landmarks, K_uu_inv_sqrt, T)` | Map samples into the cached Nyström feature space. | mapped tensor |
-| `pre_compute_summaries(y_pos, landmarks, K_uu_inv_sqrt, T)` | Precompute positive-sample summaries. | `(Ap, bp)` |
-| `attraction(y_neg, landmarks, K_uu_inv_sqrt, Ap, bp, T)` | Compute attraction toward positive samples. | tensor |
-| `repulsion(y_neg, T)` | Compute normalized negative-sample repulsion. | tensor |
-| `compute_V(y_neg, landmarks, K_uu_inv_sqrt, Ap, bp, T=1.0)` | Return attraction minus repulsion. | tensor |
-| `drift_loss(generated, landmarks, K_uu_inv_sqrt, Ap, bp, T)` | Regress generated latents toward one detached Nyström drift step. | `(loss, V)` |
-| `recon_loss`, `kl_loss`, `variance_loss`, `covariance_loss` | Same loss terms as above. | scalar tensors |
-| `total_loss(..., landmarks, K_uu_inv_sqrt, Ap, bp, ...)` | Combine the loss terms using the Nyström drift. | `(total, loss_items)` |
+Start with `rotate=False`; the known representation is easy to inspect. Add a
+rotation only after the basic experiment works.
 
-Prepare the cache once, then reuse it during training:
+## Deterministic paired comparisons
 
 ```python
-landmarks = select_landmarks(y_pos)
-K_cache = build_nystrom_cache(landmarks, temp)
-Ap, bp = pre_compute_summaries(y_pos, landmarks, K_cache, temp)
+from src.data import make_paired_run_inputs
+
+paired = make_paired_run_inputs(
+    n_steps=200,
+    dataset_size=len(problem.target),
+    batch_size=500,
+    noise_dim=16,
+    n_landmarks=128,
+    evaluation_size=2048,
+    seed=7,
+)
 ```
+
+Reuse the same `paired` object for raw and known-signal runs. It contains:
+
+- `real_batch_indices[step]`;
+- `training_noise[step]`;
+- one fixed `landmark_indices` tensor for the cached Xpress comparison;
+- `evaluation_noise`.
+
+Use `save_paired_run_inputs` and `load_paired_run_inputs` to replay the exact
+schedule on another machine. Use `clone_state_dict` / `load_initial_state` from
+`experiments.py` so generators also start from identical weights.
+
+## External evaluators
+
+```python
+from src.evaluators import DistributionEvaluator, MNISTExternalEvaluator
+```
+
+`DistributionEvaluator` fixes reference samples, SWD projection randomness,
+and an MMD bandwidth estimated only from the reference. `make_toy_evaluator`
+constructs its observed/signal/nuisance views.
+
+`MNISTExternalEvaluator` wraps the frozen classifier-space evaluation already
+implemented in `eval.py`. Train that classifier once with
+`fit_mnist_evaluator`, freeze it, and reuse it for every method.
+
+External metrics are never passed to the optimizer. If a metric becomes part
+of `compute_phi_loss`, use a different held-out evaluator for the final curves.
+
+## Evolution snapshots
+
+`EvolutionRecorder` evaluates the same queries throughout training. Your loop
+only decides when parameters are updated.
+
+```python
+from src.experiments import EvolutionRecorder
+
+recorder = EvolutionRecorder(
+    fixed_queries=paired.evaluation_noise,
+    generate_fn=lambda generator, noise: generator(noise.to(device)),
+    evaluator_fn=evaluator.evaluate,
+    every=5,
+    output_dir="artifacts/raw/seed_7",
+)
+
+recorder.record(0, generator)
+
+# Your explicit optimizer loop:
+# for step in range(1, 201):
+#     ... calculate the loss, backward, optimizer.step() ...
+#     recorder.record(step, generator, extra_metrics={"train_loss": loss.item()})
+
+run = recorder.to_run_result(method="raw", seed=7, elapsed_seconds=elapsed)
+```
+
+The recorder stores scalar curves and optionally generated samples such as
+`samples_step_000050.pt`. Use `save_model_checkpoint` separately when a full
+model/optimizer checkpoint is useful.
+
+## Comparison and plots
+
+```python
+from src.experiments import ExperimentConfig, run_comparison, save_comparison
+from src.diagnostics import plot_discrepancy_curves
+
+config = ExperimentConfig(
+    dataset="toy32",
+    methods=("raw", "known_signal"),
+    seeds=(7, 17, 27),
+    primary_metric="signal_swd",
+    epsilon=None,          # discovery: inspect the scale first
+    fixed_budget=200,
+)
+
+result = run_comparison(
+    config,
+    run_one=my_training_function,
+    paired_factory=make_inputs_for_seed,
+)
+
+plot_discrepancy_curves(result, metric_name="signal_swd")
+save_comparison(result)
+result.summary
+```
+
+`my_training_function(config, method, seed, paired_inputs)` is your training
+loop and returns a `RunResult`. `run_comparison` handles method ordering,
+re-seeding, reuse of the per-seed paired object, timing, and aggregation.
+
+## Convergence diagnostics
+
+| Function | Meaning |
+| --- | --- |
+| `steps_to_threshold(steps, discrepancies, epsilon=...)` | First measured step reaching a predeclared target. |
+| `discrepancy_auc(steps, discrepancies)` | Total discrepancy accumulated over training; lower means useful states arrived sooner. |
+| `fixed_budget_discrepancy(..., budget=...)` | Quality after the same number of updates. |
+| `field_consistency(...)` | Cosine agreement, normalized variance, and SNR of independent field estimates. Diagnostic only. |
+| `kernel_effective_neighbors(weights)` | Whether a kernel is nearly uniform, extremely local, or numerically zero. |
+| `gram_spectrum(matrix)` | Kernel effective rank and conditioning. |
+| `capture_parameters` + `generator_update_diagnostics` | Gradient and actual optimizer-update magnitudes. |
+
+## What you implement
+
+The research-owned extension points are:
+
+1. The architecture choices for `PhiNetwork` in `models/phi.py`.
+2. `compute_phi_loss` in `representation.py`.
+3. `train_phi` and `train_generator_with_frozen_phi` in `trainers/loops.py`.
+
+Ordinary VAE pretraining may remain in its current notebook until that loop is
+stable enough to extract; it is not required for the first particle toy.
+
+The supervised signal-recovery helper is only an integration sanity check. The
+exploratory notebook also demonstrates a differentiable one-step probe objective;
+the final research loss is still undecided. Monitor `validate_representation`
+and add regularization only in response to an observed failure.
+
+## Recommended order
+
+1. Verify raw `field.compute_exact_field` matches legacy `drift.compute_V` when representation is `None`.
+2. Write a very small particle loop and compare raw versus known signal on one seed.
+3. Run the same control with the representation-aware Xpress cache and three paired seeds.
+4. Use the supervised phi notebook section to verify that a frozen neural representation reaches the oracle path.
+5. Replace the supervised helper with a drift-aware `compute_phi_loss` and validate it first on a small pilot.
+6. Freeze phi, build its Xpress cache, initialize a fresh paired generator, and run the final comparison.
